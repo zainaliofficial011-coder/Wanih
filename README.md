@@ -1,2 +1,0 @@
-# Wanih
-APK builder
