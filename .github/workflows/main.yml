@@ -1,0 +1,114 @@
+name: build-from-zip
+
+# Is file ka sahi path: .github/workflows/build-from-zip.yml
+# Repo root mein koi bhi .zip rakhein (jaise WaniTerminal.zip ya WaniTerminal (2).zip).
+# Ya Actions se Run workflow dabayein aur zip_url mein direct link dein.
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: 'Optional: project zip ka direct URL (khali chhodein to repo root ki zip use hogi)'
+        required: false
+        default: ''
+  push:
+    paths:
+      - '*.zip'
+      - '.github/workflows/build-from-zip.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Get project zip
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+        run: |
+          mkdir -p work
+          ZIP_FILE=$(ls -1 ./*.zip 2>/dev/null | head -n 1 || true)
+          if [ -n "$ZIP_URL" ]; then
+            echo "Downloading zip from URL"
+            curl -fL --retry 3 "$ZIP_URL" -o work/project.zip
+          elif [ -n "$ZIP_FILE" ]; then
+            echo "Using zip from repo root: $ZIP_FILE"
+            cp "$ZIP_FILE" work/project.zip
+          else
+            echo "::error::Repo root mein koi .zip file nahi mili, aur zip_url bhi nahi diya gaya"
+            exit 1
+          fi
+
+      - name: Extract zip and locate project
+        run: |
+          rm -rf work/src
+          mkdir -p work/src
+          unzip -q work/project.zip -d work/src
+
+          SETTINGS=$(find work/src -name settings.gradle.kts -not -path '*/build/*' -print -quit)
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::Zip ke andar settings.gradle.kts nahi mila. Kya ye sahi project zip hai?"
+            exit 1
+          fi
+          PROJECT_DIR=$(dirname "$SETTINGS")
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project found at: $PROJECT_DIR"
+          ls -la "$PROJECT_DIR"
+
+      - name: Check proot binaries
+        run: |
+          for f in libproot.so libprootloader.so; do
+            if [ ! -f "$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a/$f" ]; then
+              echo "::warning::$f missing hai. APK ban jayegi, lekin phone par terminal start nahi hoga."
+            fi
+          done
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform and build tools
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate Gradle wrapper
+        run: |
+          cd "$PROJECT_DIR"
+          gradle wrapper --gradle-version 8.7
+          chmod +x gradlew
+
+      - name: Build debug APK
+        run: |
+          cd "$PROJECT_DIR"
+          ./gradlew assembleDebug --stacktrace --no-daemon
+
+      - name: Copy APK to output folder
+        run: |
+          mkdir -p out
+          cp "$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk" out/WaniTerminal-debug.apk
+          ls -la out
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: WaniTerminal-debug-apk
+          path: out/WaniTerminal-debug.apk
+          if-no-files-found: error
+          retention-days: 14
