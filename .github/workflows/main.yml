@@ -1,0 +1,212 @@
+name: build-apk
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: 'Project zip ka URL (khali = repo root ki .zip file use hogi)'
+        required: false
+        default: ''
+      rootfs_url:
+        description: 'Debian arm64 rootfs .tar.xz ka URL (khali = variable ROOTFS_URL)'
+        required: false
+        default: ''
+      rootfs_sha256:
+        description: 'Rootfs ka SHA-256 (khali = variable ROOTFS_SHA256)'
+        required: false
+        default: ''
+      proot_url:
+        description: 'libproot.so (arm64) ka URL (khali = variable PROOT_URL)'
+        required: false
+        default: ''
+      proot_loader_url:
+        description: 'libprootloader.so (arm64) ka URL (khali = variable PROOT_LOADER_URL)'
+        required: false
+        default: ''
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ZIP_URL: ${{ inputs.zip_url }}
+      ROOTFS_URL: ${{ inputs.rootfs_url || vars.ROOTFS_URL }}
+      ROOTFS_SHA256: ${{ inputs.rootfs_sha256 || vars.ROOTFS_SHA256 }}
+      PROOT_URL: ${{ inputs.proot_url || vars.PROOT_URL }}
+      PROOT_LOADER_URL: ${{ inputs.proot_loader_url || vars.PROOT_LOADER_URL }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Locate project (repo ya zip se)
+        run: |
+          mkdir -p work
+          if [ -f settings.gradle.kts ]; then
+            PROJECT_DIR="."
+            echo "Project repo root mein mila"
+          else
+            if [ -n "$ZIP_URL" ]; then
+              echo "Zip download ho rahi hai"
+              curl -fL --retry 3 "$ZIP_URL" -o work/project.zip
+            else
+              ZIP_FILE=$(ls -1 ./*.zip 2>/dev/null | head -n 1 || true)
+              if [ -z "$ZIP_FILE" ]; then
+                echo "::error::Repo root mein na settings.gradle.kts hai, na koi .zip file"
+                exit 1
+              fi
+              echo "Zip use ho rahi hai: $ZIP_FILE"
+              cp "$ZIP_FILE" work/project.zip
+            fi
+            rm -rf work/src
+            mkdir -p work/src
+            unzip -q work/project.zip -d work/src
+            SETTINGS=$(find work/src -name settings.gradle.kts -not -path '*/build/*' -print -quit)
+            if [ -z "$SETTINGS" ]; then
+              echo "::error::Zip ke andar settings.gradle.kts nahi mila"
+              exit 1
+            fi
+            PROJECT_DIR=$(dirname "$SETTINGS")
+          fi
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project folder: $PROJECT_DIR"
+          ls -la "$PROJECT_DIR"
+
+      - name: Write rootfs settings into Config.kt
+        run: |
+          python3 - << 'PY'
+          import os, re, sys
+
+          proj = os.environ["PROJECT_DIR"]
+          path = os.path.join(proj, "app/src/main/java/com/wani/terminal/Config.kt")
+          src = open(path, encoding="utf-8").read()
+
+          def set_const(text, name, value):
+              if not value:
+                  return text
+              if '"' in value or "\\" in value:
+                  sys.exit(f"::error::{name} mein quote ya backslash nahi chalega")
+              new, count = re.subn(
+                  r'const val %s = ".*?"' % name,
+                  'const val %s = "%s"' % (name, value),
+                  text,
+              )
+              if count != 1:
+                  sys.exit(f"::error::{name} Config.kt mein nahi mila")
+              print(f"{name} set ho gaya")
+              return new
+
+          src = set_const(src, "ROOTFS_URL", os.environ.get("ROOTFS_URL", "").strip())
+          src = set_const(src, "ROOTFS_SHA256", os.environ.get("ROOTFS_SHA256", "").strip().lower())
+          open(path, "w", encoding="utf-8").write(src)
+
+          if not re.fullmatch(r"[0-9a-f]{64}", os.environ.get("ROOTFS_SHA256", "").strip().lower()):
+              print("::warning::ROOTFS_SHA256 valid nahi hai (64 hex characters chahiye). Terminal setup fail hoga.")
+          if not os.environ.get("ROOTFS_URL", "").strip():
+              print("::warning::ROOTFS_URL set nahi hai. Terminal setup fail hoga.")
+          PY
+
+      - name: Fetch proot binaries
+        run: |
+          DIR="$PROJECT_DIR/app/src/main/jniLibs/arm64-v8a"
+          mkdir -p "$DIR"
+
+          fetch() {
+            url="$1"
+            dest="$2"
+            curl -fsSL --retry 3 "$url" -o "$dest"
+            magic=$(head -c 4 "$dest" | od -An -tx1 | tr -d ' \n')
+            if [ "$magic" != "7f454c46" ]; then
+              echo "::error::$dest ek ELF binary nahi hai. URL check karein."
+              exit 1
+            fi
+            machine=$(od -An -tx1 -j 18 -N 1 "$dest" | tr -d ' \n')
+            if [ "$machine" != "b7" ]; then
+              echo "::error::$dest arm64 (aarch64) binary nahi hai"
+              exit 1
+            fi
+            echo "$dest OK (ELF arm64)"
+          }
+
+          if [ ! -f "$DIR/libproot.so" ]; then
+            if [ -n "$PROOT_URL" ]; then
+              fetch "$PROOT_URL" "$DIR/libproot.so"
+            fi
+          fi
+          if [ ! -f "$DIR/libprootloader.so" ]; then
+            if [ -n "$PROOT_LOADER_URL" ]; then
+              fetch "$PROOT_LOADER_URL" "$DIR/libprootloader.so"
+            fi
+          fi
+
+          for f in libproot.so libprootloader.so; do
+            if [ ! -f "$DIR/$f" ]; then
+              echo "::warning::$f nahi hai. APK ban jayegi, lekin phone par terminal start nahi hoga."
+            fi
+          done
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform and build tools
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build debug APK
+        run: |
+          cd "$PROJECT_DIR"
+          gradle wrapper --gradle-version 8.7
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace --no-daemon
+
+      - name: Copy APK to output folder
+        run: |
+          mkdir -p out
+          cp "$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk" out/WaniTerminal-debug.apk
+          ls -la out
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: WaniTerminal-debug-apk
+          path: out/WaniTerminal-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: WaniTerminal-debug-apk
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: WaniTerminal-debug.apk
